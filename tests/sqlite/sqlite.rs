@@ -1,10 +1,13 @@
+use futures::StreamExt;
 use futures::TryStreamExt;
-use sqlx::sqlite::SqlitePoolOptions;
+use rand::Rng;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{
-    query, sqlite::Sqlite, sqlite::SqliteRow, Column, Connection, Executor, Row, SqliteConnection,
-    SqlitePool, Statement, TypeInfo,
+    query, sqlite::Sqlite, sqlite::SqliteRow, Column, ConnectOptions, Connection, Executor, Row,
+    SqliteConnection, SqlitePool, Statement, TypeInfo,
 };
 use sqlx_test::new;
+use std::time::Duration;
 
 #[sqlx_macros::test]
 async fn it_connects() -> anyhow::Result<()> {
@@ -591,4 +594,52 @@ async fn row_dropped_after_connection_doesnt_panic() {
     drop(conn);
     sqlx_rt::sleep(std::time::Duration::from_secs(1)).await;
     drop(books);
+}
+
+// note: to repro issue #1467 this should be run in release mode
+#[sqlx_macros::test]
+async fn issue_1467() -> sqlx::Result<()> {
+    let mut conn = SqliteConnectOptions::new()
+        .filename(":memory:")
+        .connect()
+        .await?;
+
+    sqlx::query(
+        r#"
+    CREATE TABLE kv (k PRIMARY KEY, v);
+    CREATE INDEX idx_kv ON kv (v);
+    "#,
+    )
+    .execute(&mut conn)
+    .await?;
+
+    let mut rng = rand::thread_rng();
+    for i in 0..1_000_000 {
+        if i % 1_000 == 0 {
+            println!("{}", i);
+        }
+        let key = rng.gen_range(0..1_000);
+        let value = rng.gen_range(0..1_000);
+        let mut tx = conn.begin().await?;
+
+        let exists = sqlx::query("SELECT 1 FROM kv WHERE k = ?")
+            .bind(key)
+            .fetch_optional(&mut tx)
+            .await?;
+        if exists.is_some() {
+            sqlx::query("UPDATE kv SET v = ? WHERE k = ?")
+                .bind(value)
+                .bind(key)
+                .execute(&mut tx)
+                .await?;
+        } else {
+            sqlx::query("INSERT INTO kv(k, v) VALUES (?, ?)")
+                .bind(key)
+                .bind(value)
+                .execute(&mut tx)
+                .await?;
+        }
+        tx.commit().await?;
+    }
+    Ok(())
 }

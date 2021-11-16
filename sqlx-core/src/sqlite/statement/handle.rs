@@ -14,13 +14,14 @@ use libsqlite3_sys::{
     sqlite3_column_bytes, sqlite3_column_count, sqlite3_column_database_name,
     sqlite3_column_decltype, sqlite3_column_double, sqlite3_column_int, sqlite3_column_int64,
     sqlite3_column_name, sqlite3_column_origin_name, sqlite3_column_table_name,
-    sqlite3_column_type, sqlite3_column_value, sqlite3_db_handle, sqlite3_finalize, sqlite3_sql,
-    sqlite3_stmt, sqlite3_stmt_readonly, sqlite3_table_column_metadata, sqlite3_value,
-    SQLITE_MISUSE, SQLITE_OK, SQLITE_TRANSIENT, SQLITE_UTF8,
+    sqlite3_column_type, sqlite3_column_value, sqlite3_db_handle, sqlite3_finalize, sqlite3_reset,
+    sqlite3_sql, sqlite3_step, sqlite3_stmt, sqlite3_stmt_readonly, sqlite3_table_column_metadata,
+    sqlite3_value, SQLITE_DONE, SQLITE_MISUSE, SQLITE_OK, SQLITE_ROW, SQLITE_TRANSIENT,
+    SQLITE_UTF8,
 };
 
 use crate::error::{BoxDynError, Error};
-use crate::sqlite::connection::ConnectionHandleRef;
+use crate::sqlite::connection::ConnectionHandleRaw;
 use crate::sqlite::type_info::DataType;
 use crate::sqlite::{SqliteError, SqliteTypeInfo};
 use std::ops::Deref;
@@ -36,14 +37,13 @@ pub(crate) struct StatementHandleRef {
     // https://doc.rust-lang.org/reference/destructors.html#destructors
     // the statement *must* be dropped before the connection
     statement: Arc<StatementHandle>,
-    connection: ConnectionHandleRef,
+    connection: ConnectionHandleRaw,
 }
 
 // access to SQLite3 statement handles are safe to send and share between threads
 // as long as the `sqlite3_step` call is serialized.
 
 unsafe impl Send for StatementHandle {}
-unsafe impl Sync for StatementHandle {}
 
 impl StatementHandle {
     pub(super) fn new(ptr: NonNull<sqlite3_stmt>) -> Self {
@@ -306,9 +306,32 @@ impl StatementHandle {
         unsafe { sqlite3_clear_bindings(self.0.as_ptr()) };
     }
 
+    pub(crate) fn reset(&mut self) -> Result<(), SqliteError> {
+        // SAFETY: we have exclusive access to the handle
+        unsafe {
+            if sqlite3_reset(self.0.as_ptr()) != SQLITE_OK {
+                return Err(SqliteError::new(self.db_handle()));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn step(&mut self) -> Result<bool, SqliteError> {
+        // SAFETY: we have exclusive access to the handle
+        unsafe {
+            match sqlite3_step(self.0.as_ptr()) {
+                SQLITE_ROW => Ok(true),
+                SQLITE_DONE => Ok(false),
+                SQLITE_ERROR => Err(SqliteError::new(self.db_handle())),
+                SQLITE_MISUSE => panic!("misuse!"),
+            }
+        }
+    }
+
     pub(crate) fn to_ref(
         self: &Arc<StatementHandle>,
-        conn: ConnectionHandleRef,
+        conn: ConnectionHandleRaw,
     ) -> StatementHandleRef {
         StatementHandleRef {
             statement: Arc::clone(self),

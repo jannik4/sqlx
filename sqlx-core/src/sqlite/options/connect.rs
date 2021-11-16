@@ -1,7 +1,6 @@
 use crate::connection::ConnectOptions;
 use crate::error::Error;
 use crate::executor::Executor;
-use crate::sqlite::connection::establish::establish;
 use crate::sqlite::{SqliteConnectOptions, SqliteConnection};
 use futures_core::future::BoxFuture;
 use log::LevelFilter;
@@ -15,17 +14,25 @@ impl ConnectOptions for SqliteConnectOptions {
         Self::Connection: Sized,
     {
         Box::pin(async move {
-            let mut conn = establish(self).await?;
+            let mut conn = SqliteConnection::establish(self).await?;
 
             // send an initial sql statement comprised of options
             let mut init = String::new();
 
-            for (key, value) in self.pragmas.iter() {
+            for (key, value) in &self.pragmas {
                 use std::fmt::Write;
                 write!(init, "PRAGMA {} = {}; ", key, value).ok();
             }
 
             conn.execute(&*init).await?;
+
+            if !self.collations.is_empty() {
+                let mut locked = conn.lock_database().await?;
+
+                for collation in &self.collations {
+                    collation.create(&mut locked.guard.handle)?;
+                }
+            }
 
             Ok(conn)
         })

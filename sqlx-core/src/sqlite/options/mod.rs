@@ -11,9 +11,13 @@ use crate::connection::LogSettings;
 pub use auto_vacuum::SqliteAutoVacuum;
 pub use journal_mode::SqliteJournalMode;
 pub use locking_mode::SqliteLockingMode;
+use std::cmp::Ordering;
+use std::sync::Arc;
 use std::{borrow::Cow, time::Duration};
 pub use synchronous::SqliteSynchronous;
 
+use crate::common::DebugFn;
+use crate::sqlite::connection::collation::Collation;
 use indexmap::IndexMap;
 
 /// Options and flags which can be used to configure a SQLite connection.
@@ -61,7 +65,14 @@ pub struct SqliteConnectOptions {
     pub(crate) log_settings: LogSettings,
     pub(crate) immutable: bool,
     pub(crate) pragmas: IndexMap<Cow<'static, str>, Cow<'static, str>>,
+
+    pub(crate) command_channel_size: usize,
+    pub(crate) row_channel_size: usize,
+
+    pub(crate) collations: Vec<Collation>,
+
     pub(crate) serialized: bool,
+    pub(crate) thread_name: Arc<DebugFn<dyn Fn(usize) -> String + Send + Sync + 'static>>,
 }
 
 impl Default for SqliteConnectOptions {
@@ -110,7 +121,11 @@ impl SqliteConnectOptions {
             log_settings: Default::default(),
             immutable: false,
             pragmas,
+            collations: Default::default(),
             serialized: false,
+            thread_name: Arc::new(DebugFn(|id| format!("sqlx-sqlite-worker-{}", id))),
+            command_channel_size: 50,
+            row_channel_size: 50,
         }
     }
 
@@ -232,6 +247,31 @@ impl SqliteConnectOptions {
         self
     }
 
+    /// Add a custom collation for comparing strings in SQL.
+    ///
+    /// If a collation with the same name already exists, it will be replaced.
+    ///
+    /// See [`sqlite3_create_collation()`](https://www.sqlite.org/c3ref/create_collation.html) for details.
+    ///
+    /// Note this excerpt:
+    /// > The collating function must obey the following properties for all strings A, B, and C:
+    /// >
+    /// > If A==B then B==A.
+    /// > If A==B and B==C then A==C.
+    /// > If A<B THEN B>A.
+    /// > If A<B and B<C then A<C.
+    /// >
+    /// > If a collating function fails any of the above constraints and that collating function is
+    /// > registered and used, then the behavior of SQLite is undefined.
+    pub fn collation<N, F>(mut self, name: N, collate: F) -> Self
+    where
+        N: Into<Arc<str>>,
+        F: Fn(&str, &str) -> Ordering + Send + Sync + 'static,
+    {
+        self.collations.push(Collation::new(name, collate));
+        self
+    }
+
     pub fn immutable(mut self, immutable: bool) -> Self {
         self.immutable = immutable;
         self
@@ -244,6 +284,32 @@ impl SqliteConnectOptions {
     /// See [open](https://www.sqlite.org/c3ref/open.html) for more details.
     pub fn serialized(mut self, serialized: bool) -> Self {
         self.serialized = serialized;
+        self
+    }
+
+    /// Provide a callback to generate the name of the background worker thread.
+    ///
+    /// The value passed to the callback is an auto-incremented integer for use as the thread ID.
+    pub fn thread_name(
+        mut self,
+        generator: impl Fn(usize) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.thread_name = Arc::new(DebugFn(generator));
+        self
+    }
+
+    /// Set the maximum number of commands to buffer for the worker thread before backpressure is
+    /// applied.
+    pub fn command_buffer_size(mut self, size: usize) -> Self {
+        self.command_channel_size = size;
+        self
+    }
+
+    /// Set the maximum number of rows to buffer back to the calling task when a query is executed.
+    ///
+    /// If the calling task cannot keep up, backpressure will be applied to limit memory usage.
+    pub fn row_buffer_size(mut self, size: usize) -> Self {
+        self.row_channel_size = size;
         self
     }
 }
